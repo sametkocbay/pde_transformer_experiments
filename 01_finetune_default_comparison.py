@@ -59,7 +59,7 @@ def compute_nrmse(pred, target):
 
 # Rollout-Bereich: Zeitschritt 10 bis 20
 start_step = 10
-end_step = 20
+end_step = 99
 print(f"\nRollout von Zeitschritt {start_step} (t={time[start_step]:.2f}s) bis {end_step} (t={time[end_step]:.2f}s)")
 
 # Extrahiere Startfelder bei t=start_step
