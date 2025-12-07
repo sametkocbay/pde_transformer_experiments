@@ -1,6 +1,5 @@
 import torch
 import numpy as np
-import h5py
 from pathlib import Path
 from pdetransformer.core.mixed_channels import PDETransformer
 from src.data_loader import find_first_h5, load_shear_velocity
@@ -10,94 +9,162 @@ import matplotlib.pyplot as plt
 # Gerät
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-# Datensatz
-dataset_dir = str(Path("dataset") / "sf_128x256_reynolds_1_00e+03_schmidt_1_00e+00_width_2_50e-01_nshear_2_nblobs_2")
-filename = str(find_first_h5(dataset_dir))
+# Test-Datensätze aus data_splits.txt laden
+splits_file = Path('checkpoints') / 'data_splits.txt'
+test_dirs = []
+if splits_file.exists():
+    with open(splits_file, 'r') as f:
+        lines = f.readlines()
+    in_test = False
+    for line in lines:
+        if line.strip() == "TEST:":
+            in_test = True
+            continue
+        if in_test and line.strip().startswith("sf_"):
+            test_dirs.append(Path("dataset") / line.strip())
+print(f"Test-Datensätze gefunden: {len(test_dirs)}")
 
-# Lade Velocity-Feld und Koordinaten
+# Ersten Test-Datensatz verwenden
+dataset_dir = str(test_dirs[0])
+filename = str(find_first_h5(dataset_dir))
+print(f"Evaluiere auf: {dataset_dir}")
+
+# Lade Daten
 d = load_shear_velocity(filename)
 vel = d['vel']
 time = d['time']
 x = d['x']
 z = d['z']
 
-# Modell
-print("Lade vortrainiertes PDE-Transformer Modell...")
+# Finetuned Modell laden
+print("Lade finetuned PDE-Transformer Modell...")
 model = PDETransformer.from_pretrained('thuerey-group/pde-transformer', subfolder='mc-s').to(device)
+ckpt_path = Path('checkpoints') / 'pde_transformer_finetuned_best.pt'
+if ckpt_path.exists():
+    state = torch.load(ckpt_path, map_location=device, weights_only=True)
+    model.load_state_dict(state)
+    print(f"Finetuned Gewichte geladen: {ckpt_path}")
+else:
+    print("WARNUNG: Keine finetuned Gewichte gefunden!")
 model.eval()
 
-# Rollout-Parameter
-num_rollout_steps = len(time) - 1  # Anzahl der Vorhersage-Schritte
 
-# Extrahiere Startfelder bei t=0
-if vel.ndim == 4:
-    if vel.shape[1] == 2:
-        u_init = vel[0, 0]
-        w_init = vel[0, 1]
-    elif vel.shape[3] == 2:
-        u_init = vel[0, :, :, 0]
-        w_init = vel[0, :, :, 1]
-    else:
-        raise RuntimeError(f"Unbekannte Velocity-Shape: {vel.shape}")
+def compute_nrmse(pred, target):
+    """Normalized Root Mean Squared Error."""
+    mse = np.mean((pred - target) ** 2)
+    rmse = np.sqrt(mse)
+    nrmse = rmse / (np.std(target) + 1e-8)
+    return nrmse
+
+
+# Rollout-Bereich: Zeitschritt 10 bis 20
+start_step = 10
+end_step = 20
+print(f"\nRollout von Zeitschritt {start_step} (t={time[start_step]:.2f}s) bis {end_step} (t={time[end_step]:.2f}s)")
+
+# Extrahiere Startfelder bei t=start_step
+if vel.shape[1] == 2:
+    u_init = vel[start_step, 0]
+    w_init = vel[start_step, 1]
 else:
-    raise RuntimeError(f"Unerwartete Dimensionen: {vel.shape}")
+    u_init = vel[start_step, :, :, 0]
+    w_init = vel[start_step, :, :, 1]
 
-# Speicher für Rollout-Ergebnisse
+# Rollout
+num_rollout_steps = end_step - start_step
 predictions_u = [u_init.copy()]
 predictions_w = [w_init.copy()]
-divergences = []
-
-# Aktueller Zustand für Rollout
 current_u = u_init.copy()
 current_w = w_init.copy()
 
 print(f"Starte Rollout mit {num_rollout_steps} Schritten...")
 
-# Rollout-Schleife
 for step in range(num_rollout_steps):
-    # Input vorbereiten
-    input_field = np.stack([current_u, current_w], axis=0)[None, ...]  # (B=1, C=2, X, Z)
+    input_field = np.stack([current_u, current_w], axis=0)[None, ...]
     input_tensor = torch.from_numpy(input_field).float().to(device)
-    class_labels = torch.ones((1,), dtype=torch.long).to(device) * 1000  # unbekannte Klasse
+    class_labels = torch.ones((1,), dtype=torch.long, device=device) * 1000
 
-    # Vorhersage
     with torch.no_grad():
         out = model(hidden_states=input_tensor, class_labels=class_labels)
-        pred = out.sample.detach().cpu().numpy()[0]  # (C, X, Z)
+        pred = out.sample.cpu().numpy()[0]
 
-    # Extrahiere u, w
     current_u = pred[0]
     current_w = pred[1] if pred.shape[0] > 1 else np.zeros_like(current_u)
-
     predictions_u.append(current_u.copy())
     predictions_w.append(current_w.copy())
 
-    # Divergenz berechnen
-    div_pred = compute_divergence(current_u, current_w, x, z)
-    mean_div, max_div = divergence_stats(div_pred)
-    divergences.append((mean_div, max_div))
+# Metriken berechnen
+print("\n" + "=" * 60)
+print("EVALUATION ERGEBNISSE")
+print("=" * 60)
 
-    if step % 10 == 0 or step == num_rollout_steps - 1:
-        print(f"  Step {step + 1}/{num_rollout_steps}: div mean={mean_div:.2e}, maxAbs={max_div:.2e}")
+nrmse_u_list = []
+nrmse_w_list = []
+div_gt_list = []
+div_pred_list = []
 
-# Ground-Truth Divergenz für Vergleich
-gt_divergences = []
-for t_idx in range(len(time)):
+for i, t_idx in enumerate(range(start_step, end_step + 1)):
+    # Ground Truth
     if vel.shape[1] == 2:
-        u_gt = vel[t_idx, 0]
-        w_gt = vel[t_idx, 1]
+        u_gt, w_gt = vel[t_idx, 0], vel[t_idx, 1]
     else:
-        u_gt = vel[t_idx, :, :, 0]
-        w_gt = vel[t_idx, :, :, 1]
+        u_gt, w_gt = vel[t_idx, :, :, 0], vel[t_idx, :, :, 1]
+
+    # NRMSE
+    nrmse_u = compute_nrmse(predictions_u[i], u_gt)
+    nrmse_w = compute_nrmse(predictions_w[i], w_gt)
+    nrmse_u_list.append(nrmse_u)
+    nrmse_w_list.append(nrmse_w)
+
+    # Divergenz
     div_gt = compute_divergence(u_gt, w_gt, x, z)
-    gt_divergences.append(divergence_stats(div_gt))
+    div_pred = compute_divergence(predictions_u[i], predictions_w[i], x, z)
+    _, max_div_gt = divergence_stats(div_gt)
+    _, max_div_pred = divergence_stats(div_pred)
+    div_gt_list.append(max_div_gt)
+    div_pred_list.append(max_div_pred)
 
-# Visualisierung: Vergleich zu verschiedenen Zeitpunkten
-plot_steps = [0, len(time) // 4, len(time) // 2, 3 * len(time) // 4, len(time) - 1]
-fig, axes = plt.subplots(3, len(plot_steps), figsize=(4 * len(plot_steps), 10))
+    print(f"t={t_idx:3d}: NRMSE(u)={nrmse_u:.4f}, NRMSE(w)={nrmse_w:.4f} | "
+          f"maxDiv GT={max_div_gt:.2e}, Pred={max_div_pred:.2e}")
 
-for col, t_idx in enumerate(plot_steps):
-    # GT
+print("\n" + "-" * 60)
+print(f"Gesamt NRMSE(u):  mean={np.mean(nrmse_u_list):.4f}, final={nrmse_u_list[-1]:.4f}")
+print(f"Gesamt NRMSE(w):  mean={np.mean(nrmse_w_list):.4f}, final={nrmse_w_list[-1]:.4f}")
+print(f"Divergenz GT:     mean={np.mean(div_gt_list):.2e}, max={np.max(div_gt_list):.2e}")
+print(f"Divergenz Pred:   mean={np.mean(div_pred_list):.2e}, max={np.max(div_pred_list):.2e}")
+
+# Visualisierung
+Path('results').mkdir(exist_ok=True)
+
+# Plot 1: NRMSE über Zeit
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+time_axis = list(range(start_step, end_step + 1))
+axes[0].plot(time_axis, nrmse_u_list, label='NRMSE(u)', marker='o')
+axes[0].plot(time_axis, nrmse_w_list, label='NRMSE(w)', marker='s')
+axes[0].set_xlabel('Zeitschritt')
+axes[0].set_ylabel('NRMSE')
+axes[0].set_title(f'NRMSE über Rollout (t={start_step} bis t={end_step})')
+axes[0].legend()
+axes[0].grid(True)
+
+axes[1].semilogy(time_axis, div_gt_list, label='GT max|div|', linestyle='--', marker='o')
+axes[1].semilogy(time_axis, div_pred_list, label='Pred max|div|', marker='s')
+axes[1].set_xlabel('Zeitschritt')
+axes[1].set_ylabel('Max |Divergenz|')
+axes[1].set_title('Divergenz über Rollout')
+axes[1].legend()
+axes[1].grid(True)
+
+plt.tight_layout()
+plt.savefig(Path('results') / 'test_evaluation_metrics.png', dpi=150)
+plt.show()
+
+# Plot 2: Vergleich zu verschiedenen Zeitpunkten
+plot_indices = [0, num_rollout_steps // 2, num_rollout_steps]
+fig, axes = plt.subplots(3, len(plot_indices), figsize=(4 * len(plot_indices), 10))
+
+for col, pred_idx in enumerate(plot_indices):
+    t_idx = start_step + pred_idx
     if vel.shape[1] == 2:
         u_gt = vel[t_idx, 0]
     else:
@@ -108,11 +175,10 @@ for col, t_idx in enumerate(plot_steps):
     axes[0, col].imshow(u_gt.T, cmap='RdBu_r', origin='lower', vmin=vmin, vmax=vmax)
     axes[0, col].set_title(f'GT t={t_idx}')
 
-    axes[1, col].imshow(predictions_u[t_idx].T, cmap='RdBu_r', origin='lower', vmin=vmin, vmax=vmax)
-    axes[1, col].set_title(f'Pred t={t_idx}')
+    axes[1, col].imshow(predictions_u[pred_idx].T, cmap='RdBu_r', origin='lower', vmin=vmin, vmax=vmax)
+    axes[1, col].set_title(f'Pred t={t_idx}\nNRMSE={nrmse_u_list[pred_idx]:.3f}')
 
-    # Fehler
-    error = predictions_u[t_idx] - u_gt
+    error = predictions_u[pred_idx] - u_gt
     limit = max(1e-5, np.max(np.abs(error)))
     axes[2, col].imshow(error.T, cmap='seismic', origin='lower', vmin=-limit, vmax=limit)
     axes[2, col].set_title(f'Error t={t_idx}')
@@ -121,25 +187,17 @@ axes[0, 0].set_ylabel('Ground Truth')
 axes[1, 0].set_ylabel('Prediction')
 axes[2, 0].set_ylabel('Error')
 plt.tight_layout()
-plt.savefig(Path('results') / 'rollout_comparison.png', dpi=150)
+plt.savefig(Path('results') / 'test_rollout_comparison.png', dpi=150)
 plt.show()
 
-# Divergenz über Zeit plotten
-fig, ax = plt.subplots(figsize=(10, 5))
-ax.semilogy([d[1] for d in gt_divergences], label='GT maxAbs(div)', linestyle='--')
-ax.semilogy([d[1] for d in divergences], label='Pred maxAbs(div)')
-ax.set_xlabel('Zeitschritt')
-ax.set_ylabel('Max |Divergenz|')
-ax.legend()
-ax.set_title('Divergenz-Entwicklung über Rollout')
-plt.tight_layout()
-plt.savefig(Path('results') / 'divergence_over_time.png', dpi=150)
-plt.show()
+# Ergebnisse speichern
+with open(Path('results') / 'test_evaluation.txt', 'w') as f:
+    f.write(f"Test-Datensatz: {dataset_dir}\n")
+    f.write(f"Rollout: Zeitschritt {start_step} bis {end_step}\n")
+    f.write("=" * 60 + "\n\n")
+    f.write(f"Gesamt NRMSE(u): mean={np.mean(nrmse_u_list):.6f}, final={nrmse_u_list[-1]:.6f}\n")
+    f.write(f"Gesamt NRMSE(w): mean={np.mean(nrmse_w_list):.6f}, final={nrmse_w_list[-1]:.6f}\n\n")
+    f.write(f"Divergenz GT:   mean={np.mean(div_gt_list):.6e}, max={np.max(div_gt_list):.6e}\n")
+    f.write(f"Divergenz Pred: mean={np.mean(div_pred_list):.6e}, max={np.max(div_pred_list):.6e}\n")
 
-# Speichere Metriken
-Path('results').mkdir(exist_ok=True)
-with open(Path('results') / 'baseline_divergence.txt', 'w') as f:
-    f.write("Rollout Divergenz-Metriken\n")
-    f.write("=" * 50 + "\n")
-    for step, (mean_div, max_div) in enumerate(divergences):
-        f.write(f"Step {step + 1}: mean={mean_div:.6e}, maxAbs={max_div:.6e}\n")
+print(f"\nErgebnisse gespeichert in 'results/'")
